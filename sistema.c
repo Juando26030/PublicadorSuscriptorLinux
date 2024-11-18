@@ -29,14 +29,10 @@ News *news_head = NULL;
 Subscriber *subscribers_head = NULL;
 pthread_mutex_t news_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t subs_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t timer_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 int running = 1;
 time_t last_publication_time;
 
-pthread_t timer_thread, news_processor_thread;
-
-// Función para limpiar el sistema al cerrar
+// Función para cerrar el sistema de manera ordenada al finalizar
 void cleanup() {
     pthread_mutex_lock(&news_mutex);
     while (news_head) {
@@ -64,13 +60,7 @@ void cleanup() {
 void handle_sigint(int sig) {
     (void)sig;
     printf("\n[Sistema]: Señal de interrupción recibida. Finalizando...\n");
-    running = 0;
-
-    pthread_cancel(timer_thread);
-    pthread_cancel(news_processor_thread);
-
-    unlink("pipePSC");
-    unlink("pipeSSC");
+    running = 0;  // Señal de terminación para los hilos
 }
 
 void enqueue_news(char topic, const char *content) {
@@ -93,11 +83,8 @@ void enqueue_news(char topic, const char *content) {
     }
     pthread_mutex_unlock(&news_mutex);
 
-    pthread_mutex_lock(&timer_mutex);
-    last_publication_time = time(NULL);  // Reinicia el temporizador
-    pthread_mutex_unlock(&timer_mutex);
-
     printf("[Sistema]: Noticia almacenada: Tópico %c, Contenido '%s'\n", topic, content);
+    last_publication_time = time(NULL);  // Reinicia el temporizador
 }
 
 News *dequeue_news() {
@@ -157,48 +144,6 @@ void add_subscriber(int fd, const char *topics) {
     printf("[Sistema]: Nuevo suscriptor añadido. Pipe único: %s, Tópicos: %s\n", new_sub->pipe_name, topics);
 }
 
-void *publisher_handler(void *arg) {
-    int fd = *((int *)arg);
-    free(arg);
-
-    char buffer[MAX_NEWS_LENGTH + 3];
-    while (running) {
-        int bytesRead = read(fd, buffer, sizeof(buffer));
-        if (bytesRead > 0) {
-            char topic = buffer[0];
-            if (strchr("AECPS", topic)) {
-                enqueue_news(topic, buffer + 2);
-            } else {
-                fprintf(stderr, "[Sistema]: Tópico inválido recibido: %c\n", topic);
-            }
-        } else if (bytesRead <= 0) {
-            break;
-        }
-    }
-
-    close(fd);
-    return NULL;
-}
-
-void *listener_for_publishers(void *arg) {
-    char *pipePSC = (char *)arg;
-    while (running) {
-        int fd = open(pipePSC, O_RDONLY);
-        if (fd == -1) {
-            perror("[Sistema]: Error abriendo pipePSC para lectura");
-            break;
-        }
-
-        int *new_fd = malloc(sizeof(int));
-        *new_fd = fd;
-
-        pthread_t publisher_thread;
-        pthread_create(&publisher_thread, NULL, publisher_handler, new_fd);
-        pthread_detach(publisher_thread);
-    }
-    return NULL;
-}
-
 void process_news() {
     while (running) {
         News *news = dequeue_news();
@@ -226,19 +171,67 @@ void process_news() {
     }
 }
 
+void *publisher_handler(void *arg) {
+    char *pipePSC = (char *)arg;
+    int fd = open(pipePSC, O_RDONLY);
+    if (fd == -1) {
+        perror("[Sistema]: Error abriendo pipePSC");
+        exit(EXIT_FAILURE);
+    }
+
+    char buffer[MAX_NEWS_LENGTH + 3];
+    while (running) {
+        int bytesRead = read(fd, buffer, sizeof(buffer));
+        if (bytesRead > 0) {
+            char topic = buffer[0];
+            if (strchr("AECPS", topic)) {
+                enqueue_news(topic, buffer + 2);
+            } else {
+                fprintf(stderr, "[Sistema]: Tópico inválido recibido: %c\n", topic);
+            }
+        } else if (bytesRead == -1) {
+            perror("[Sistema]: Error leyendo del pipePSC");
+            break;
+        }
+    }
+
+    close(fd);
+    return NULL;
+}
+
+void *subscriber_handler(void *arg) {
+    char *pipeSSC = (char *)arg;
+    int fd = open(pipeSSC, O_RDONLY);
+    if (fd == -1) {
+        perror("[Sistema]: Error abriendo pipeSSC para lectura");
+        exit(EXIT_FAILURE);
+    }
+
+    char buffer[MAX_TOPICS + 1];
+    while (running && read(fd, buffer, sizeof(buffer)) > 0) {
+        buffer[strcspn(buffer, "\n")] = '\0';
+        printf("[Sistema]: Tópicos recibidos del suscriptor: %s\n", buffer);
+        int sub_fd = open(pipeSSC, O_WRONLY);
+        if (sub_fd == -1) {
+            perror("[Sistema]: Error abriendo pipe del suscriptor para escritura");
+            continue;
+        }
+        add_subscriber(sub_fd, buffer);
+        close(sub_fd);
+    }
+
+    close(fd);
+    return NULL;
+}
+
 void *timer_handler(void *arg) {
     int *timeF = (int *)arg;
     while (running) {
         sleep(1);
-
-        pthread_mutex_lock(&timer_mutex);
         if (difftime(time(NULL), last_publication_time) >= *timeF) {
             printf("[Sistema]: Tiempo finalizado sin nuevas publicaciones. Cerrando sistema...\n");
-            pthread_mutex_unlock(&timer_mutex);
-            raise(SIGINT);
-            break;
+            running = 0;
         }
-        pthread_mutex_unlock(&timer_mutex);
     }
     return NULL;
 }
@@ -269,17 +262,19 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_sigint);
     last_publication_time = time(NULL);
 
-    pthread_t listener_thread;
-    pthread_create(&listener_thread, NULL, listener_for_publishers, pipePSC);
-
-    pthread_create(&timer_thread, NULL, timer_handler, &timeF);
+    pthread_t publisher_thread, subscriber_thread, news_processor_thread, timer_thread;
+    pthread_create(&publisher_thread, NULL, publisher_handler, pipePSC);
+    pthread_create(&subscriber_thread, NULL, subscriber_handler, pipeSSC);
     pthread_create(&news_processor_thread, NULL, (void *)process_news, NULL);
+    pthread_create(&timer_thread, NULL, timer_handler, &timeF);
 
-    pthread_join(listener_thread, NULL);
-    pthread_join(timer_thread, NULL);
+    pthread_join(publisher_thread, NULL);
+    pthread_join(subscriber_thread, NULL);
     pthread_join(news_processor_thread, NULL);
+    pthread_join(timer_thread, NULL);
 
     cleanup();
     printf("[Sistema]: Finalizado correctamente.\n");
+    exit(EXIT_SUCCESS);
     return 0;
 }
