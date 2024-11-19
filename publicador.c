@@ -3,82 +3,71 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <ctype.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
-#define MAX_NEWS_LENGTH 80
-
-// Validar formato de las noticias
-int validate_news_format(const char *news) {
-    if (strlen(news) < 3 || strlen(news) > MAX_NEWS_LENGTH) return 0; // Longitud válida
-    if (!isupper(news[0]) || news[1] != ':') return 0;                // Categoría válida
-    if (!strchr("AECPS", news[0])) return 0;                          // Tópico permitido
-    return 1;
-}
-
-// Publicar noticias desde el archivo al sistema de comunicación
-void publish_news(const char *pipePSC, const char *file, int timeN) {
-    // Abrir el pipePSC para escritura
-    int fd = open(pipePSC, O_WRONLY);
-    if (fd == -1) {
-        perror("[Publicador]: Error al abrir el pipePSC");
-        exit(EXIT_FAILURE);
-    }
-
-    // Abrir el archivo de noticias
-    FILE *fp = fopen(file, "r");
-    if (!fp) {
-        perror("[Publicador]: Error al abrir el archivo de noticias");
-        close(fd);
-        exit(EXIT_FAILURE);
-    }
-
-    char news[MAX_NEWS_LENGTH + 1];
-    while (fgets(news, sizeof(news), fp)) {
-        // Eliminar salto de línea
-        news[strcspn(news, "\n")] = '\0';
-
-        // Validar formato de la noticia
-        if (validate_news_format(news)) {
-            // Enviar la noticia al pipe
-            if (write(fd, news, strlen(news) + 1) == -1) {
-                perror("[Publicador]: Error al enviar la noticia");
-            } else {
-                printf("[Publicador]: Noticia enviada: %s\n", news);
-            }
-            sleep(timeN); // Esperar `timeN` segundos antes de enviar la siguiente
-        } else {
-            fprintf(stderr, "[Publicador]: Formato inválido: %s\n", news);
+// Función para enviar noticias desde un archivo a través de un pipe
+void enviarNoticias(const char *pipePSC, const char *fileName, int intervalo) {
+    // Verificar si el pipe existe; si no, crearlo con permisos 0666
+    if (access(pipePSC, F_OK) == -1) {
+        if (mkfifo(pipePSC, 0666) == -1) {
+            perror("Error al crear el pipe");
+            exit(1);
         }
     }
 
-    fclose(fp); // Cerrar el archivo
-    close(fd);  // Cerrar el pipe
-    printf("[Publicador]: Finalizado.\n");
+    // Abrir el pipe en modo de solo escritura
+    int pipeFd = open(pipePSC, O_WRONLY);
+    if (pipeFd == -1) {
+        perror("Error al abrir el pipe");
+        exit(1);
+    }
+
+    // Abrir el archivo de noticias en modo de solo lectura
+    FILE *file = fopen(fileName, "r");
+    if (!file) {
+        perror("Error al abrir el archivo de noticias");
+        close(pipeFd);
+        exit(1);
+    }
+
+    char buffer[100]; // Buffer para almacenar cada línea de noticias
+    // Leer y enviar línea por línea desde el archivo a través del pipe
+    while (fgets(buffer, sizeof(buffer), file)) {
+        write(pipeFd, buffer, strlen(buffer)); // Enviar la línea a través del pipe
+        printf("Noticia enviada: %s", buffer); // Mostrar la noticia enviada
+        sleep(intervalo); // Esperar el tiempo especificado entre envíos
+    }
+
+    // Cerrar el pipe y el archivo al finalizar
+    fclose(file);
+    close(pipeFd);
 }
 
 // Función principal
 int main(int argc, char *argv[]) {
-    char *pipePSC = NULL;
-    char *file = NULL;
-    int timeN = 0;
+    const char *pipePSC = NULL; // Nombre del pipe para comunicación con el sistema
+    const char *fileName = NULL; // Nombre del archivo con noticias
+    int intervalo = 1;          // Tiempo de espera entre envíos (por defecto: 1 segundo)
 
-    // Parsear argumentos
+    // Procesar los argumentos de la línea de comandos
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0) {
             pipePSC = argv[++i];
         } else if (strcmp(argv[i], "-f") == 0) {
-            file = argv[++i];
+            fileName = argv[++i];
         } else if (strcmp(argv[i], "-t") == 0) {
-            timeN = atoi(argv[++i]);
+            intervalo = atoi(argv[++i]);
         }
     }
 
-    // Validar argumentos
-    if (!pipePSC || !file || timeN <= 0) {
-        fprintf(stderr, "Uso: %s -p pipePSC -f file -t timeN\n", argv[0]);
-        return EXIT_FAILURE;
+    // Verificar que se proporcionaron los argumentos obligatorios
+    if (pipePSC && fileName) {
+        enviarNoticias(pipePSC, fileName, intervalo); // Iniciar el envío de noticias
+    } else {
+        // Mostrar un mensaje de uso si faltan argumentos
+        fprintf(stderr, "Uso: %s -p <pipePSC> -f <archivo> -t <intervalo>\n", argv[0]);
     }
 
-    publish_news(pipePSC, file, timeN); // Llamar a la función para publicar noticias
     return 0;
 }
